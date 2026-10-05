@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS meeting_index(
   meeting_date TEXT, track_slug TEXT, feature_race_url TEXT PRIMARY KEY, feature_title TEXT,
   distance_m INTEGER, prize_money REAL, track_rating_label TEXT, track_rating_num INTEGER,
   scraped_at TEXT, done INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS eq_tracks(
+  code TEXT PRIMARY KEY, name TEXT, country TEXT, added_at TEXT);
 CREATE TABLE IF NOT EXISTS chart_text(
   pdf_url TEXT PRIMARY KEY, track_code TEXT, race_date TEXT, pdf_path TEXT, text TEXT,
   fetched_at TEXT, parsed INTEGER DEFAULT 0);
@@ -147,6 +149,8 @@ def connect(path):
     con.row_factory = sqlite3.Row
     con.create_function("norm", 1, norm)
     con.executescript(SCHEMA)
+    con.executescript(EXTRA_SCHEMA)
+    _migrate(con)
     return con
 
 # ------------------------------------------------------------------ fetcher
@@ -604,13 +608,106 @@ def pdf_to_text(path):
     with pdfplumber.open(path) as pdf:
         return "\n\f".join((pg.extract_text(layout=True) or "") for pg in pdf.pages)
 
-def crawl_equibase(con, fetcher, tracks, since, pdf_dir="equibase_pdfs", calendar_url=EQ_CAL):
+_TID = re.compile(r"[?&]tid=([A-Za-z0-9]+)(?:&ctry=([A-Za-z]+))?")
+
+def parse_equibase_tracks(path):
+    """Extract (code, name, country) from a saved Equibase 'Full Charts' page (.html) or a
+    'print to PDF' of it. Codes come from the links (tid=XXX&ctry=YYY); nothing is requested from the site."""
+    found = []                                   # (code, country, name_or_None) in page order
+    if path.lower().endswith(".pdf"):
+        import subprocess
+        try:
+            import pypdf
+        except ImportError:
+            sys.exit("PDF input needs pypdf:  pip install pypdf   (or save the page as .html instead)")
+        links = []
+        for pg in pypdf.PdfReader(path).pages:
+            for a in pg.get("/Annots") or []:
+                uri = (a.get_object().get("/A") or {}).get("/URI") or ""
+                m = _TID.search(uri)
+                if m: links.append((m.group(1).upper(), (m.group(2) or "").upper()))
+        txt = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, text=True).stdout
+        names = [re.split(r"\s{2,}", l.strip())[0] for l in txt.splitlines()
+                 if re.search(r"No Racing|\d(?:st|nd|rd|th) Post|Racing Today|Post\s+\d", l)]
+        if len(names) == len(links):
+            found = [(c, k, n) for (c, k), n in zip(links, names)]
+        else:                                    # can't pair safely: keep codes, skip names
+            print(f"note: {len(links)} links but {len(names)} track names; storing codes without names", file=sys.stderr)
+            found = [(c, k, None) for c, k in links]
+    else:
+        html = open(path, encoding="utf-8", errors="ignore").read()
+        for a in BeautifulSoup(html, "html.parser").find_all("a", href=True):
+            m = _TID.search(a["href"])
+            if m:
+                found.append((m.group(1).upper(), (m.group(2) or "").upper(), a.get_text(" ", strip=True) or None))
+        if not found:                            # JS-built pages: fall back to raw regex over the source
+            found = [(m.group(1).upper(), (m.group(2) or "").upper(), None) for m in _TID.finditer(html)]
+    out = {}
+    for c, k, n in found:                        # dedupe (featured list repeats tracks); prefer a real name
+        if c not in out or (n and not out[c][1]): out[c] = (k, n)
+    return [(c, n, k) for c, (k, n) in out.items()]
+
+def import_tracks(con, path):
+    rows = parse_equibase_tracks(path)
+    ts = now_iso()
+    for c, n, k in rows:
+        con.execute("INSERT INTO eq_tracks(code,name,country,added_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(code) DO UPDATE SET name=COALESCE(excluded.name,name), country=COALESCE(NULLIF(excluded.country,''),country)",
+                    (c, n, k, ts))
+    con.commit()
+    print(f"{len(rows)} tracks stored in eq_tracks:")
+    for c, n, k in rows: print(f"  {c:5} {k:4} {n or ''}")
+
+def stored_track_codes(con, countries=None, exclude=None):
+    rows = con.execute("SELECT code, country FROM eq_tracks ORDER BY code").fetchall()
+    cs = {x.strip().upper() for x in countries.split(",")} if countries else None
+    ex = {x.strip().upper() for x in exclude.split(",")} if exclude else set()
+    return [r["code"] for r in rows if (not cs or (r["country"] or "").upper() in cs) and r["code"] not in ex]
+
+class RateLimiter:
+    """Global politeness limit shared by all worker threads: request *starts* are at least
+    `interval` seconds apart no matter how many threads are running."""
+    def __init__(self, interval):
+        import threading
+        self.interval, self._lock, self._next = interval, threading.Lock(), 0.0
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next)
+            self._next = slot + self.interval
+        if slot > now: time.sleep(slot - now)
+
+def _download_chart(url, dest, ua, limiter, local):
+    """Runs in a worker thread. Touches NO sqlite. Returns (status, sha, text)."""
+    p = urlparse(url)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return 200, None, pdf_to_text(dest)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if p.scheme == "file":
+        import shutil; shutil.copyfile(p.path, dest)
+        return 200, None, pdf_to_text(dest)
+    sess = getattr(local, "sess", None)
+    if sess is None:
+        sess = local.sess = requests.Session(); sess.headers["User-Agent"] = ua
+    limiter.wait()
+    r = sess.get(url, timeout=60)
+    sha = hashlib.sha256(r.content).hexdigest()
+    if r.status_code != 200 or not r.content.startswith(b"%PDF"):
+        return r.status_code, sha, None
+    with open(dest, "wb") as f: f.write(r.content)
+    return 200, sha, pdf_to_text(dest)
+
+def crawl_equibase(con, fetcher, tracks, since, pdf_dir="equibase_pdfs", calendar_url=EQ_CAL, workers=1):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    workers = max(1, int(workers))
+    jobs = []                      # (track, date, url, dest)
     for track in tracks:
         track = track.strip().upper()
         cal = calendar_url.format(track=track)
         try:
             html = fetcher.get(cal, use_cache=False)
-        except (PermissionError, RuntimeError) as e:
+        except (PermissionError, RuntimeError, OSError, requests.RequestException) as e:
             print(f"[{track}] calendar unavailable: {e}", file=sys.stderr); continue
         days = [(d, u) for d, u in parse_equibase_calendar(html, track, cal) if d >= since]
         print(f"[{track}] {len(days)} race days since {since}")
@@ -619,16 +716,41 @@ def crawl_equibase(con, fetcher, tracks, since, pdf_dir="equibase_pdfs", calenda
                   "save the page and send it so the link extraction can be adjusted", file=sys.stderr)
         for d, url in days:
             if con.execute("SELECT 1 FROM chart_text WHERE pdf_url=?", (url,)).fetchone(): continue
-            dest = os.path.join(pdf_dir, track, url.split("/")[-1])
+            if not fetcher.allowed(url):          # robots checked here, on the main thread
+                print(f"  [skip {d}] {fetcher.deny_reason}", file=sys.stderr); continue
+            jobs.append((track, d, url, os.path.join(pdf_dir, track, url.split("/")[-1])))
+    if not jobs:
+        print("nothing to download"); return
+    first = jobs[0][2]
+    interval = max(fetcher.delay, fetcher.crawl_delay(first)) if urlparse(first).scheme != "file" else 0.0
+    print(f"{len(jobs)} charts to fetch, {workers} worker(s), one request every {interval:g}s overall "
+          f"(~{len(jobs) * interval / 60:.0f} min minimum)")
+    limiter, local = RateLimiter(interval), threading.local()
+    done = failed = 0
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futs = {ex.submit(_download_chart, u, dest, fetcher.ua, limiter, local): (t, d, u, dest)
+                for t, d, u, dest in jobs}
+        for fu in as_completed(futs):
+            t, d, u, dest = futs[fu]
             try:
-                fetcher.get_bytes(url, dest)
-                txt = pdf_to_text(dest)
-            except (PermissionError, RuntimeError) as e:
-                print(f"  [skip {d}] {e}", file=sys.stderr); continue
+                status, sha, txt = fu.result()
+            except Exception as e:
+                failed += 1; print(f"  [skip {t} {d}] {type(e).__name__}: {e}", file=sys.stderr); continue
+            if sha:
+                con.execute("INSERT INTO raw_pages VALUES(?,?,?,?,?)", (u, now_iso(), status, sha, dest))
+            if txt is None:
+                failed += 1; print(f"  [skip {t} {d}] HTTP {status} / not a PDF: {u}", file=sys.stderr)
+                con.commit(); continue
             con.execute("INSERT OR REPLACE INTO chart_text(pdf_url,track_code,race_date,pdf_path,text,fetched_at) VALUES(?,?,?,?,?,?)",
-                        (url, track, d.isoformat(), dest, txt, now_iso()))
-            con.commit()
-            print(f"  {d} {len(txt)} chars", flush=True)
+                        (u, t, d.isoformat(), dest, txt, now_iso()))
+            con.commit(); done += 1
+            print(f"  [{done + failed}/{len(jobs)}] {t} {d} {len(txt)} chars", flush=True)
+    except KeyboardInterrupt:
+        print("\ninterrupted - cancelling pending downloads (finished ones are saved; re-run to resume)", file=sys.stderr)
+        ex.shutdown(wait=False, cancel_futures=True); con.commit(); raise SystemExit(130)
+    ex.shutdown(wait=True)
+    print(f"done: {done} stored, {failed} failed")
 
 # ------------------------------------------------------------------ Betfair BSP
 # URL pattern is from memory and UNVERIFIED - check Betfair's data page and pass --url / --file.
@@ -761,6 +883,442 @@ def export(con, out, d0=None, d1=None):
         except Exception:
             pass
 
+# ------------------------------------------------------------------ Equibase chart parser (text -> tables)
+# Charts list runners in OFFICIAL FINISH ORDER, so finish_pos = row order. Pedigree (sire/dam) is only
+# printed for the WINNER. The layout below is written from knowledge of the chart format and must be
+# validated against real files: run `parse-charts --report` and inspect failures.
+EXTRA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS us_race_extra(
+  race_id TEXT PRIMARY KEY, track_code TEXT, race_date TEXT, race_no INTEGER, surface TEXT, weather TEXT,
+  track_condition TEXT, distance_text TEXT, distance_furlongs REAL, race_type TEXT, claiming_price REAL,
+  purse REAL, off_time TEXT, fractions_json TEXT, final_time_s REAL, winner_name TEXT, scratched TEXT,
+  header_text TEXT, n_runners INTEGER, parse_ok INTEGER, issues TEXT, pdf_url TEXT);
+CREATE TABLE IF NOT EXISTS us_run_extra(
+  run_id TEXT PRIMARY KEY, program TEXT, equipment TEXT, last_raced TEXT, post_pos INTEGER,
+  calls_json TEXT, favorite INTEGER, odds_to_1 REAL, comment TEXT, owner TEXT, raw_line TEXT);
+CREATE TABLE IF NOT EXISTS us_payouts(
+  race_id TEXT, pool TEXT, combo TEXT, base REAL, payout REAL);
+"""
+FURLONG_M, MILE_M, YARD_M = 201.168, 1609.344, 0.9144
+_WORDS = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10}
+_DEN = {"sixteenth":16,"sixteenths":16,"eighth":8,"eighths":8,"half":2,"halves":2,"quarter":4,"quarters":4,"fourth":4,"fourths":4}
+_COND_NUM = {"fast":1,"firm":1,"good":3,"standard":2,"wet fast":4,"yielding":4,"slow":5,"soft":6,"sloppy":6,
+             "muddy":7,"heavy":8,"sealed":6,"frozen":2}
+
+def _num_words(tok):
+    t = tok.lower().strip()
+    m = re.fullmatch(r"(\d+)(?:\s+(\d+)/(\d+))?", t)
+    if m: return int(m.group(1)) + (int(m.group(2)) / int(m.group(3)) if m.group(2) else 0)
+    m = re.fullmatch(r"(\w+)(?:\s+and\s+(\w+)\s+(\w+))?", t)
+    if m and m.group(1) in _WORDS:
+        v = float(_WORDS[m.group(1)])
+        if m.group(2):
+            n = _WORDS.get(m.group(2), 1 if m.group(2) == "a" else None); d = _DEN.get(m.group(3))
+            if n and d: v += n / d
+        return v
+    return None
+
+_ONES = {w: i for i, w in enumerate("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split(), 1)}
+_TENS = {w: 10 * i for i, w in enumerate("twenty thirty forty fifty sixty seventy eighty ninety".split(), 2)}
+def words_to_int(s):
+    """'Eight Hundred And Seventy' -> 870; None if any word is not a number word."""
+    cur, seen = 0, False
+    for w in re.findall(r"[a-z]+|\d+", s.lower()):
+        if w == "and": continue
+        if w.isdigit(): cur += int(w)
+        elif w in _ONES: cur += _ONES[w]
+        elif w in _TENS: cur += _TENS[w]
+        elif w == "hundred": cur = max(cur, 1) * 100
+        else: return None
+        seen = True
+    return cur if seen else None
+
+def parse_chart_distance(h):
+    ym = re.match(r"(?i)\s*(?:about\s+)?((?:[a-z]+\s+|\d+\s+)+?)yards?\b", h)
+    if ym:
+        y = words_to_int(ym.group(1))
+        if y:
+            metres = y * YARD_M
+            return f"{y} Yards", round(metres / FURLONG_M, 3), round(metres)
+    return _parse_chart_distance_fm(h)
+
+def _parse_chart_distance_fm(h):
+    """Return (text, furlongs, metres) from a header like '5 1/2 Furlongs' / 'One And One Sixteenth Miles'."""
+    m = re.search(r"(?i)((?:about\s+)?)((?:\d+(?:\s+\d+/\d+)?)|(?:one|two|three|four|five|six|seven|eight|nine|ten)"
+                  r"(?:\s+and\s+(?:one|two|three|five|seven|a)\s+(?:sixteenths?|eighths?|halves|half|quarters?|fourths?))?)\s+"
+                  r"(furlongs?|miles?|yards?)", h)
+    if not m: return None, None, None
+    v = _num_words(m.group(2)); unit = m.group(3).lower()
+    if v is None: return None, None, None
+    metres = v * (FURLONG_M if unit.startswith("f") else MILE_M if unit.startswith("m") else YARD_M)
+    ym = re.search(r"(?i)\band\s+(\d+)\s+yards", h[m.end():m.end() + 25])
+    if ym: metres += int(ym.group(1)) * YARD_M
+    return m.group(0).strip(), round(metres / FURLONG_M, 3), round(metres)
+
+def _ptime(s):
+    if not s: return None
+    s = s.strip().lstrip(":")
+    m = re.fullmatch(r"(?:(\d+):)?(\d+(?:\.\d+)?)", s)
+    return (int(m.group(1) or 0) * 60 + float(m.group(2))) if m else None
+
+_HDR = re.compile(r"^\s*(?P<track>\S.*?)\s*-\s*(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\s*-\s*Race\s+(?P<n>\d{1,2})\s*$")
+
+def split_chart_races(text):
+    """[(race_no, race_date_or_None, block_text)] split on 'TRACK - Month D, YYYY - Race N' header lines.
+    (pdftotext sometimes splits the track name: 'ALBUQ UERQUE'; the text before the date is ignored.)"""
+    lines = text.replace("\f", "\n").splitlines()
+    marks = []
+    for i, l in enumerate(lines):
+        m = _HDR.match(l)
+        if m:
+            try: d = dt.datetime.strptime(re.sub(r"\s+", " ", m.group("date")), "%B %d, %Y").date().isoformat()
+            except ValueError: d = None
+            marks.append((i, int(m.group("n")), d))
+    blocks = []
+    for k, (i, n, d) in enumerate(marks):
+        j = marks[k + 1][0] if k + 1 < len(marks) else len(lines)
+        if blocks and blocks[-1][0] == n and blocks[-1][1] == d:        # a race that continues on the next page
+            blocks[-1] = (n, d, blocks[-1][2] + "\n" + "\n".join(lines[i + 1:j]))
+        else:
+            blocks.append((n, d, "\n".join(lines[i:j])))
+    return blocks
+
+_TABLE_END = re.compile(r"(?i)^\s*(Fractional Times|Final Time|Run-?Up|Split Times|Winner:|Scratched|Total WPS|Trainers?:|Owners?:|Footnotes)")
+_RUNNER = re.compile(r"^\s*(?:(?P<last>\d{1,2}[A-Za-z]{3}\d{2}\s+\d{1,2}[A-Za-z0-9]{2,6}|-{2,}|—+)\s+)?(?P<pgm>\d{1,2}[A-Z]?)\s+(?P<rest>\S.*)$")
+# after the name: Wgt  M/E  PP  Start  <calls...>  Odds  Comments
+_TAIL = re.compile(r"\s(?P<wt>[1-9]\d{2})\s+(?:(?P<me>--|-\s-|[A-Za-z][A-Za-z ]{0,5}?)\s+)?(?P<pp>\d{1,2})\s+(?P<start>\d{1,2})\s+"
+                   r"(?P<calls>.*?)\s+(?P<odds>\*?\d{1,3}\.\d{2}\*?)(?:\s+(?P<itime>\d{1,2}\.\d{3})\s+(?P<spidx>\d{1,3}))?(?:\s+(?P<comment>.*))?$")
+_MARG_WORDS = {"nose": .05, "head": .2, "neck": .3}
+
+def _margin_text_to_l(t):
+    t = (t or "").strip()
+    if not t: return None
+    if t.lower() in _MARG_WORDS: return _MARG_WORDS[t.lower()]
+    m = re.fullmatch(r"(?:(\d+)\s+)?(\d+)/(\d+)", t)
+    if m: return int(m.group(1) or 0) + int(m.group(2)) / int(m.group(3))
+    m = re.fullmatch(r"(\d+)(?:\s+(\d+)/(\d+))?", t)
+    if m: return int(m.group(1)) + (int(m.group(2)) / int(m.group(3)) if m.group(2) else 0)
+    return None
+
+_TAIL_NOSTART = re.compile(_TAIL.pattern.replace(r"\s+(?P<start>\d{1,2})\s+", r"\s+"))
+
+def parse_runner_line(line, has_start=True):
+    m = _RUNNER.match(line)
+    if not m: return None
+    rest = m.group("rest")
+    t = (_TAIL if has_start else _TAIL_NOSTART).search(" " + rest)
+    if not t: return None
+    name = (" " + rest)[:t.start()].strip()
+    jock = None
+    jm = re.search(r"\(([^)]*[ ,][^)]*)\)\s*$", name)               # '(Zamora, Francisco)' but not '(IRE)'
+    if jm: jock, name = jm.group(1).strip(), name[:jm.start()].strip()
+    calls = [c.strip() for c in re.split(r"\s{2,}", t.group("calls").strip()) if c.strip()]
+    od = t.group("odds")
+    return dict(last_raced=m.group("last"), program=m.group("pgm"), name=re.sub(r"\s+", " ", name),
+                jockey=jock, weight_lb=int(t.group("wt")), equipment=re.sub(r"\s+", "", t.group("me") or "") or None,
+                post_pos=int(t.group("pp")), start_pos=int(t.group("start")) if has_start else None, calls=calls,
+                odds_to_1=float(od.strip("*")), favorite="*" in od, comment=(t.group("comment") or "").strip() or None,
+                ind_time_s=float(t.group("itime")) if t.group("itime") else None, speed_index=int(t.group("spidx")) if t.group("spidx") else None,
+                raw=line.rstrip())
+
+def _grab(block, pat, flags=re.I):
+    m = re.search(pat, block, flags)
+    return next((g.strip() for g in m.groups() if g), None) if m else None
+
+_STOP = r"(?:\n\s*\n|\n\s*(?:Breeder|Owners?|Trainers?|Scratched|Footnotes|Claiming Prices|Total WPS|\d+ Claimed|Run-?Up|Fractional|Final|Split|Winner|Weather)\b|\n\s*\$\d)"
+def _joined(block, start_pat, stop_pat=_STOP):
+    m = re.search(start_pat, block, re.I)
+    if not m: return None
+    seg = block[m.end():]; e = re.search(stop_pat, seg, re.I)
+    return re.sub(r"\s+", " ", seg[:e.start() if e else len(seg)]).strip()
+
+_SEX = {"colt": "c", "filly": "f", "gelding": "g", "mare": "m", "horse": "h", "ridgling": "r", "stallion": "h"}
+def parse_winner_line(txt, race_year=None):
+    """'Girls Don't Cry, Bay Filly, by Crossbow out of Lady Don't Cry, by Street Cry (IRE). Foaled Mar 16, 2022 in Texas.'"""
+    if not txt: return {}
+    m = re.match(r"(?P<name>.+?),\s*(?P<csx>[A-Za-z ]+?),\s*by\s+(?P<sire>.+?)\s+out of\s+(?P<dam>.+?),\s*by\s+(?P<ds>.+?)\.\s*"
+                 r"(?:Foaled\s+(?P<foaled>[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})(?:\s+in\s+(?P<place>[A-Za-z .]+?))?\.?)?\s*$", txt)
+    if not m: return {}
+    words = m.group("csx").split()
+    sexw = words[-1].lower() if words else ""
+    out = dict(name=m.group("name").strip(), colour=" ".join(words[:-1]) or None, sex=_SEX.get(sexw), sex_word=sexw or None,
+               sire=re.sub(r"\s*\([^)]*\)", "", m.group("sire")).strip(), dam=m.group("dam").strip(),
+               dam_sire=re.sub(r"\s*\([^)]*\)", "", m.group("ds")).strip(), foaled=m.group("foaled"), bred_in=m.group("place"))
+    fy = re.search(r"(\d{4})$", m.group("foaled") or "")
+    out["age"] = (race_year - int(fy.group(1))) if (fy and race_year) else None
+    return out
+
+def _times(s):
+    return [x for x in (_ptime(t) for t in re.findall(r"(?<![\d/])(?:\d+:)?\d{1,2}\.\d{2}(?![\d/])", s or "")) if x]
+
+def _payouts(block):
+    """WIN/PLACE/SHOW per horse (column-aligned) + exotic pools, from the table under 'Pgm Horse Win Place Show Wager Type ...'."""
+    pay = []
+    lines = block.splitlines()
+    hi = next((i for i, l in enumerate(lines) if re.match(r"^\s*Pgm\s+Horse\s+Win\s+Place\s+Show", l)), None)
+    if hi is None: return pay
+    h = lines[hi]
+    ends = {k: h.index(k) + len(k) for k in ("Win", "Place", "Show")}
+    for ln in lines[hi + 1:]:
+        if not ln.strip() or re.match(r"(?i)^\s*(Past Performance|Trainers?:|Owners?:|Footnotes)", ln): break
+        wm = re.search(r"\$(\d+(?:\.\d+)?)\s+([A-Za-z0-9 /]+?)\s{2,}([\d][\d\-/, ]*?)\s+([\d,]+\.\d{2})\s+([\d,]+)\s*$", ln)
+        left = ln[:wm.start()] if wm else ln
+        hm = re.match(r"^\s*(\d{1,2}[A-Z]?)\s+(.+?)\s{2,}", left + "  ")
+        if hm:
+            for num in re.finditer(r"\d+\.\d{2}", left[hm.end():] if False else left):
+                if num.start() < hm.end() - 2: continue
+                col = min(ends, key=lambda k: abs(num.end() - ends[k]))
+                pay.append((col.upper(), f"{hm.group(1)} {hm.group(2).strip()}", 2.0, float(num.group(0))))
+        if wm:
+            pay.append((wm.group(2).strip().upper(), wm.group(3).strip(), float(wm.group(1)), float(wm.group(4).replace(",", ""))))
+    return pay
+
+def parse_race_block(block, race_no, race_date=None):
+    lines = block.splitlines()
+    ti = next((i for i, l in enumerate(lines) if re.search(r"(?i)last\s+raced", l)), None)
+    head_lines = lines[:ti] if ti is not None else lines[:14]
+    head = "\n".join(head_lines)
+    r = dict(race_no=race_no, issues=[])
+    dl = re.search(r"Distance:\s*(.+?)(?:\s{2,}|\s+Current Track Record|$)", head, re.M)
+    dtxt = dl.group(1) if dl else head
+    r["distance_text"], r["distance_furlongs"], r["distance_m"] = parse_chart_distance(dtxt)
+    s = re.search(r"(?i)on the\s+(.+)$", dtxt)
+    stxt = (s.group(1) if s else "").lower()
+    r["surface"] = ("Turf" if "turf" in stxt else "Dirt" if "dirt" in stxt else
+                    "Synthetic" if re.search(r"synthetic|all[- ]weather|tapeta|polytrack", stxt) else (s.group(1).strip().title() if s else None))
+    tm = next((re.match(r"^\s*([A-Z].*?)\s+-\s+(Thoroughbred|Quarter Horse|Arabian|Paint|Appaloosa|Mixed)\s*$", l)
+               for l in head_lines if re.match(r"^\s*[A-Z].*?\s+-\s+(Thoroughbred|Quarter Horse|Arabian|Paint|Appaloosa|Mixed)\s*$", l)), None)
+    r["race_type"], r["breed"], r["race_name"], r["grade"] = None, None, None, None
+    if tm:
+        title, r["breed"] = tm.group(1).strip(), tm.group(2)
+        vm = re.match(r"((?:(?:MAIDEN|SPECIAL|WEIGHT|CLAIMING|ALLOWANCE|OPTIONAL|STARTER|STAKES|HANDICAP|TRIAL|INVITATIONAL|AND|OR|STATE|BRED|OPEN|NW\d|FUTURITY|SWEEPSTAKES)\b\s*)+)(.*)$", title)
+        r["race_type"] = (vm.group(1).strip() if vm else re.match(r"[A-Z ]+", title).group(0).strip())
+        nm = (vm.group(2) if vm else title[len(r["race_type"]):]).strip()
+        gm = re.search(r"\bGrade\s+(\d)\b", nm)
+        r["grade"] = int(gm.group(1)) if gm else None
+        r["race_name"] = re.sub(r"\s*\bGrade\s+\d\b", "", nm).strip() or None
+    ci = next((i for i, l in enumerate(head_lines) if tm and l == tm.string), None)
+    ww = re.search(r"Wind Speed:\s*(\d+)\s+Wind Direction:\s*([A-Za-z]+)", block)
+    r["wind_speed"], r["wind_dir"] = (float(ww.group(1)), ww.group(2)) if ww else (None, None)
+    di = next((i for i, l in enumerate(head_lines) if l.strip().startswith("Distance:")), len(head_lines))
+    r["conditions"] = re.sub(r"\s+", " ", " ".join(head_lines[ci + 1:di])).strip() if ci is not None else None
+    r["purse"] = parse_money(_grab(head, r"Purse:\s*\$([\d,]+)"))
+    cp = _grab(re.sub(r"\s+", " ", head), r"Claiming Price:\s*\$([\d,]+)")
+    r["claiming_price"] = parse_money(cp)
+    wl = re.search(r"Weather:\s*(.+?)\s+Track:\s*(.+?)\s*$", block, re.M)
+    r["weather"] = wl.group(1).strip() if wl else None
+    r["track_condition"] = wl.group(2).strip() if wl else None
+    tf = re.search(r"(-?\d+)\s*°", r["weather"] or "")
+    r["temp_f"] = float(tf.group(1)) if tf else None
+    om = re.search(r"Off at:\s*([\d:]+)(?:\s+Start:\s*(.+?))?(?:\s+Timing Method:\s*(.+?))?\s*$", block, re.M)
+    r["off_time"], r["start_note"], r["timing_method"] = (om.group(1), om.group(2), om.group(3)) if om else (None, None, None)
+    fl = re.search(r"Fractional Times:\s*(.*?)(?:\s{2,}Final Time:|\s*$)", block, re.M)
+    r["fractions"] = _times(fl.group(1)) if fl else []
+    r["final_time_s"] = _ptime(_grab(block, r"Final Time:\s*([\d:.]+)"))
+    r["time_from_gate_s"] = _ptime(_grab(block, r"Time from Gate:\s*([\d:.]+)"))
+    r["total_wps_pool"] = parse_money(_grab(block, r"Total WPS Pool:\s*\$([\d,]+)"))
+    runners = []
+    if ti is not None:
+        has_start = bool(re.search(r"\bPP\s+Start\b", lines[ti]))
+        for l in lines[ti + 1:]:
+            if _TABLE_END.match(l): break
+            p = parse_runner_line(l, has_start)
+            if p: runners.append(p)
+    for p in runners:
+        p["disqualified"] = 1 if p["name"].startswith("DQ-") else 0
+        p["name"] = re.sub(r"^DQ-\s*", "", p["name"])
+    cum = 0.0
+    for i, p in enumerate(runners, 1):
+        p["crossing_pos"] = i
+        p["finish_pos"] = i
+        fin = p["calls"][-1] if p["calls"] else ""
+        mt = fin[len(str(i)):].strip() if fin.startswith(str(i)) else None
+        p["finish_call"] = fin
+        p["margin_ahead_l"] = _margin_text_to_l(mt)            # lengths ahead of the next horse home (assumed; last runner has none)
+        p["beaten_l"] = round(cum, 3)
+        cum += p["margin_ahead_l"] or 0
+    year = int(race_date[:4]) if race_date else None
+    win = parse_winner_line(_joined(block, r"Winner:\s*"), year)
+    r["winner"] = win
+    # The table lists horses in the order they CROSSED the line. Stewards' changes show in the comments
+    # ('PL 1st' = placed first, 'DQ 4' = disqualified to 4th); fall back to the winner line.
+    n = len(runners)
+    slots = [None] * n
+    for p in runners:
+        m = re.search(r"\bPL\s*(\d+)", p["comment"] or "") or re.search(r"\bDQ\s*(\d+)", p["comment"] or "")
+        if m and 1 <= int(m.group(1)) <= n and slots[int(m.group(1)) - 1] is None:
+            slots[int(m.group(1)) - 1] = p; p["_fixed"] = True
+    rest = iter([p for p in runners if not p.get("_fixed")])
+    slots = [sl if sl is not None else next(rest) for sl in slots]
+    if win and slots and norm(slots[0]["name"]) != norm(win.get("name")):
+        k = next((j for j, p in enumerate(slots) if norm(p["name"]) == norm(win["name"])), None)
+        if k is not None:
+            slots.insert(0, slots.pop(k)); r["issues"].append("placing_assumed_from_winner_line")
+    for i, p in enumerate(slots, 1): p["finish_pos"] = i
+    runners = slots
+    r["runners"] = runners
+    if not r.get("final_time_s") and runners:
+        wt = next((p["ind_time_s"] for p in runners if p["finish_pos"] == 1 and p.get("ind_time_s")), None)
+        r["final_time_s"] = wt
+    r["winner_breeder"] = _grab(block, r"^\s*Breeder:\s*(.+?)\s*$", re.I | re.M)
+    r["winner_owner"] = _grab(block, r"^\s*Owner:\s*(.+?)\s*$", re.I | re.M)
+    def pairs(s):
+        return {m.group(1).upper(): m.group(2).strip(" ;,.") for m in re.finditer(r"(\d{1,2}[A-Za-z]?)\s*-\s*(.+?)(?=;\s*\d{1,2}[A-Za-z]?\s*-|;?\s*$)", s or "")}
+    tmap = pairs(_joined(block, r"\n\s*Trainers:\s*", r"(?:\n\s*(?:Owners:|Footnotes))"))
+    omap = pairs(_joined(block, r"\n\s*Owners:\s*", r"(?:\n\s*Footnotes)"))
+    cl = {}
+    cpl = _joined(block, r"Claiming Prices:\s*", r"(?:\n\s*\n|\n\s*Total WPS)")
+    for m in re.finditer(r"(\d{1,2}[A-Za-z]?)\s*-\s*[^:;]+?:\s*\$([\d,]+)", cpl or ""):
+        cl[m.group(1).upper()] = float(m.group(2).replace(",", ""))
+    for p in runners:
+        k = p["program"].upper()
+        p["trainer"], p["owner"], p["claiming_price"] = tmap.get(k), omap.get(k), cl.get(k)
+    r["scratched"] = _joined(block, r"Scratched Horse\(s\):\s*") or None
+    low = block.lower()
+    if re.search(r"\bcancel+ed\b", "\n".join(lines[:14]).lower()) and not runners:
+        return dict(race_no=race_no, status="cancelled", issues=[])
+    if (re.search(r"value of race:\s*\$0\b", low) or "declared-no contest" in low) and not any(p["odds_to_1"] for p in runners):
+        return dict(race_no=race_no, status="no_contest", issues=[])
+    r["payouts"] = _payouts(block)
+    if len(runners) < 2: r["issues"].append("fewer_than_2_runners")
+    if not r["distance_m"]: r["issues"].append("no_distance")
+    if not r["track_condition"]: r["issues"].append("no_track_condition")
+    if not all(p["jockey"] for p in runners): r["issues"].append("missing_jockey")
+    if not all(p.get("trainer") for p in runners): r["issues"].append("missing_trainer")
+    if not win: r["issues"].append("no_winner_pedigree")
+    elif runners and norm(win.get("name")) != norm(runners[0]["name"]): r["issues"].append("winner_line_not_first_row")
+    if not r["final_time_s"]: r["issues"].append("no_final_time")
+    r["status"] = "ok"
+    if not r["breed"]: r["issues"].append("no_race_type_line")
+    return r
+
+def _migrate(con):
+    want = {"us_race_extra": [("breed", "TEXT"), ("conditions", "TEXT"), ("temp_f", "REAL"), ("start_note", "TEXT"),
+                              ("timing_method", "TEXT"), ("winner_breeder", "TEXT"), ("winner_owner", "TEXT"),
+                              ("time_from_gate_s", "REAL"), ("total_wps_pool", "REAL"), ("winner_bred_in", "TEXT"),
+                              ("race_name", "TEXT"), ("grade", "INTEGER"), ("wind_speed", "REAL"), ("wind_dir", "TEXT"), ("status", "TEXT")],
+            "us_run_extra": [("claiming_price", "REAL"), ("margin_ahead_l", "REAL"), ("finish_call", "TEXT"), ("start_pos", "INTEGER"),
+                         ("ind_time_s", "REAL"), ("speed_index", "INTEGER"), ("crossing_pos", "INTEGER"), ("disqualified", "INTEGER")]}
+    for t, cols in want.items():
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({t})")}
+        for c, ty in cols:
+            if c not in have: con.execute(f"ALTER TABLE {t} ADD COLUMN {c} {ty}")
+    con.execute("DROP VIEW IF EXISTS v_us_runs")
+    con.execute("""CREATE VIEW v_us_runs AS
+      SELECT r.race_date, r.track AS track_code, r.race_no, e.breed, e.surface, e.race_type, e.race_name, e.grade, r.distance_m, e.distance_text,
+             e.track_condition, r.track_rating_num, e.weather, e.temp_f, e.wind_speed, e.wind_dir, r.field_size, e.purse, e.claiming_price AS race_claiming_price,
+             h.name AS horse, h.sex, h.colour, h.sire, h.dam, h.dam_sire, u.program, u.post_pos, ru.jockey, ru.trainer, u.owner,
+             ru.weight_kg, u.equipment, ru.finish_pos, u.finish_call, ru.margin_l AS beaten_l, u.margin_ahead_l, u.odds_to_1,
+             u.favorite, u.crossing_pos, u.disqualified, u.ind_time_s, u.speed_index, u.claiming_price AS horse_claiming_price, e.final_time_s, u.comment, r.race_id, ru.run_id
+      FROM runs ru JOIN races r ON r.race_id=ru.race_id JOIN horses h ON h.horse_key=ru.horse_key
+      LEFT JOIN us_race_extra e ON e.race_id=r.race_id LEFT JOIN us_run_extra u ON u.run_id=ru.run_id""")
+    con.commit()
+
+def _purge_race(con, rid):
+    """Remove everything previously stored for this race so a re-parse never leaves stale or duplicate rows."""
+    con.execute("DELETE FROM us_run_extra WHERE run_id IN (SELECT run_id FROM runs WHERE race_id=?)", (rid,))
+    con.execute("DELETE FROM odds_snapshots WHERE run_id IN (SELECT run_id FROM runs WHERE race_id=?)", (rid,))
+    con.execute("DELETE FROM runs WHERE race_id=?", (rid,))
+    con.execute("DELETE FROM races WHERE race_id=?", (rid,))
+    con.execute("DELETE FROM us_payouts WHERE race_id=?", (rid,))
+
+def store_chart_race(con, track, date, race_no, r, pdf_url=None):
+    ts = now_iso(); date_s = date if isinstance(date, str) else date.isoformat()
+    mid = f"{date_s}_{norm(track)}"; rid = f"{mid}_R{race_no}"
+    _purge_race(con, rid)
+    cond = (r["track_condition"] or "").strip().lower()
+    num = _COND_NUM.get(cond)
+    if num is None and cond: num = next((v for k, v in _COND_NUM.items() if k in cond), None)
+    if r["surface"] == "Turf" and cond in ("firm", "good", "yielding", "soft", "heavy"):
+        num = {"firm": 1, "good": 3, "yielding": 5, "soft": 6, "heavy": 8}[cond]
+    hh = None
+    if r["off_time"]:
+        mm = re.match(r"(\d{1,2}):(\d{2})", r["off_time"])
+        if mm: hh = f"{int(mm.group(1)) % 12 + 12:02d}:{mm.group(2)}" if int(mm.group(1)) < 11 else f"{int(mm.group(1)):02d}:{mm.group(2)}"
+    upsert(con, "meetings", ["meeting_id"], dict(meeting_id=mid, race_date=date_s, track=track, source="equibase", scraped_at=ts))
+    klass = (f"Claiming ${int(r['claiming_price'])}" if r["claiming_price"] and r["race_type"] and "CLAIMING" in r["race_type"] else r["race_type"])
+    upsert(con, "races", ["race_id"], dict(
+        race_id=rid, meeting_id=mid, race_date=date_s, track=track, race_no=race_no, name=(r.get("race_name") or r["race_type"]), start_time=hh,
+        distance_m=r["distance_m"], prize_money=r["purse"], field_size=len(r["runners"]) or None,
+        track_rating_label=(r["track_condition"] or None), track_rating_num=num, winning_time_s=r["final_time_s"],
+        source="equibase", scraped_at=ts, **{"class": klass}))
+    win = r["winner"] or {}
+    for p in r["runners"]:
+        hk = norm(p["name"])
+        if not hk: continue
+        w = win if p["finish_pos"] == 1 else {}
+        upsert(con, "horses", ["horse_key"], dict(horse_key=hk, name=p["name"], sire=w.get("sire"), dam=w.get("dam"),
+               dam_sire=w.get("dam_sire"), sex=w.get("sex"), colour=w.get("colour"), foaled=w.get("foaled"), country=w.get("bred_in")))
+        run_id = f"{rid}_{hk}"
+        upsert(con, "runs", ["run_id"], dict(run_id=run_id, race_id=rid, horse_key=hk, saddle_cloth=to_int(p["program"]),
+               barrier=p["post_pos"], jockey=p["jockey"], trainer=p.get("trainer"), weight_kg=round(p["weight_lb"] * 0.45359237, 2),
+               gear=p["equipment"], age=w.get("age"), finish_pos=p["finish_pos"], margin_l=p["beaten_l"], scratched=0,
+               source="equibase", scraped_at=ts))
+        upsert(con, "odds_snapshots", ["run_id", "captured_at", "source", "price_type"], dict(
+            run_id=run_id, captured_at=date_s, source="equibase", price_type="final_odds", price=p["odds_to_1"] + 1))
+        upsert(con, "us_run_extra", ["run_id"], dict(
+            run_id=run_id, program=p["program"], equipment=p["equipment"], last_raced=p["last_raced"], post_pos=p["post_pos"],
+            start_pos=p["start_pos"], calls_json=json.dumps(p["calls"]), favorite=1 if p["favorite"] else 0, odds_to_1=p["odds_to_1"],
+            comment=p["comment"], owner=p.get("owner"), claiming_price=p.get("claiming_price"),
+            margin_ahead_l=p["margin_ahead_l"], finish_call=p["finish_call"], raw_line=p["raw"],
+            ind_time_s=p.get("ind_time_s"), speed_index=p.get("speed_index"), crossing_pos=p.get("crossing_pos"),
+            disqualified=p.get("disqualified", 0)))
+    upsert(con, "us_race_extra", ["race_id"], dict(
+        race_id=rid, track_code=track, race_date=date_s, race_no=race_no, surface=r["surface"], weather=r["weather"],
+        track_condition=r["track_condition"], distance_text=r["distance_text"], distance_furlongs=r["distance_furlongs"],
+        race_type=r["race_type"], claiming_price=r["claiming_price"], purse=r["purse"], off_time=r["off_time"],
+        fractions_json=json.dumps(r["fractions"]), final_time_s=r["final_time_s"],
+        winner_name=(r["runners"][0]["name"] if r["runners"] else None), scratched=r["scratched"], n_runners=len(r["runners"]),
+        parse_ok=0 if r["issues"] else 1, issues=",".join(r["issues"]), pdf_url=pdf_url, breed=r["breed"], conditions=r["conditions"],
+        temp_f=r["temp_f"], start_note=r["start_note"], timing_method=r["timing_method"], winner_breeder=r["winner_breeder"],
+        winner_owner=r["winner_owner"], time_from_gate_s=r["time_from_gate_s"], total_wps_pool=r["total_wps_pool"],
+        winner_bred_in=win.get("bred_in"), race_name=r.get("race_name"), grade=r.get("grade"),
+        wind_speed=r.get("wind_speed"), wind_dir=r.get("wind_dir"), status="ok"))
+    con.execute("DELETE FROM us_payouts WHERE race_id=?", (rid,))
+    con.executemany("INSERT INTO us_payouts VALUES(?,?,?,?,?)", [(rid, a, b, c, d) for a, b, c, d in r["payouts"]])
+    con.commit()
+    return rid
+
+def parse_charts(con, track=None, reparse=False, dump_dir=None):
+    q = "SELECT pdf_url, track_code, race_date, text FROM chart_text WHERE (? OR parsed=0) AND (? IS NULL OR track_code=?)"
+    rows = con.execute(q, (1 if reparse else 0, track, track)).fetchall()
+    tot = ok = 0; issue_count = {}; skipped = {}
+    for row in rows:
+        blocks = split_chart_races(row["text"])
+        if not blocks:
+            print(f"[{row['track_code']} {row['race_date']}] no 'TRACK - Month D, YYYY - Race N' headers found", file=sys.stderr)
+        for n, hdr_date, blk in blocks:
+            if hdr_date and hdr_date != row["race_date"]:
+                print(f"[{row['track_code']} {row['race_date']}] header date {hdr_date} differs from file-name date; using the header", file=sys.stderr)
+            date_s = hdr_date or row["race_date"]
+            try:
+                r = parse_race_block(blk, n, date_s)
+            except Exception as e:                                  # one bad race must not stop the batch
+                r = dict(race_no=n, runners=[], winner={}, payouts=[], fractions=[], issues=[f"exception:{type(e).__name__}:{e}"],
+                         distance_text=None, distance_furlongs=None, distance_m=None, surface=None, purse=None, claiming_price=None,
+                         weather=None, track_condition=None, off_time=None, race_type=None, final_time_s=None, scratched=None,
+                         breed=None, conditions=None, temp_f=None, start_note=None, timing_method=None, winner_breeder=None,
+                         winner_owner=None, time_from_gate_s=None, total_wps_pool=None, race_name=None, grade=None,
+                         wind_speed=None, wind_dir=None, status="ok")
+            if r.get("status") in ("cancelled", "no_contest"):
+                _purge_race(con, f"{date_s}_{norm(row['track_code'])}_R{n}")
+                upsert(con, "us_race_extra", ["race_id"], dict(race_id=f"{date_s}_{norm(row['track_code'])}_R{n}", track_code=row["track_code"],
+                       race_date=date_s, race_no=n, n_runners=0, parse_ok=1, issues="", status=r["status"], pdf_url=row["pdf_url"]))
+                con.commit(); skipped[r["status"]] = skipped.get(r["status"], 0) + 1
+                continue
+            store_chart_race(con, row["track_code"], date_s, n, r, row["pdf_url"])
+            tot += 1; ok += 0 if r["issues"] else 1
+            for i in r["issues"]: issue_count[i.split(":")[0]] = issue_count.get(i.split(":")[0], 0) + 1
+            if r["issues"] and dump_dir:
+                os.makedirs(dump_dir, exist_ok=True)
+                with open(os.path.join(dump_dir, f"{row['track_code']}_{date_s}_R{n}.txt"), "w") as f:
+                    f.write("# issues: " + ",".join(r["issues"]) + "\n" + blk)
+        con.execute("UPDATE chart_text SET parsed=1 WHERE pdf_url=?", (row["pdf_url"],)); con.commit()
+    con.execute("DELETE FROM horses WHERE horse_key LIKE 'dq%' AND horse_key NOT IN (SELECT horse_key FROM runs)"); con.commit()
+    print(f"parsed {tot} races from {len(rows)} charts; clean: {ok}; with issues: {tot - ok}"
+          + (f"; skipped {', '.join(f'{v} {k}' for k, v in skipped.items())}" if skipped else ""))
+    for k, v in sorted(issue_count.items(), key=lambda x: -x[1]): print(f"  {k}: {v}")
+
 # ------------------------------------------------------------------ CLI
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -781,11 +1339,23 @@ def main(argv=None):
     p.add_argument("--track"); p.add_argument("--file"); p.add_argument("--years", type=float, default=2.0)
     p.add_argument("--delay", type=float, default=3.0)
     p = sub.add_parser("equibase-crawl")
-    p.add_argument("--tracks", required=True, help="comma-separated codes, e.g. ALB,CD,SA")
+    p.add_argument("--tracks", help="comma-separated codes, e.g. ALB,CD,SA")
+    p.add_argument("--all-tracks", action="store_true", help="use every track stored by import-tracks")
+    p.add_argument("--countries", help="with --all-tracks: only these countries, e.g. USA,CAN")
+    p.add_argument("--exclude", help="with --all-tracks: codes to skip, e.g. LA,CMR")
     p.add_argument("--years", type=float, default=2.0); p.add_argument("--delay", type=float, default=5.0)
     p.add_argument("--calendar-url", default=EQ_CAL, help="override (use {track}); file:// works for tests")
+    p.add_argument("--workers", type=int, default=1, help="download/extract threads (request rate stays capped by --delay / robots Crawl-delay)")
+    p = sub.add_parser("import-tracks")
+    p.add_argument("--file", help="saved Equibase Full Charts page (.html) or its printed .pdf")
+    p.add_argument("--list", action="store_true", help="just list tracks already stored")
     p = sub.add_parser("check-robots")
     p.add_argument("urls", nargs="+")
+    p = sub.add_parser("parse-charts")
+    p.add_argument("--track"); p.add_argument("--reparse", action="store_true")
+    p.add_argument("--dump-failures", help="folder to write the text of races that parsed with issues")
+    p = sub.add_parser("show-chart")
+    p.add_argument("--track", required=True); p.add_argument("--date", required=True); p.add_argument("--lines", type=int, default=90)
     p = sub.add_parser("load-bsp")
     p.add_argument("--url"); p.add_argument("--file"); p.add_argument("--date")
     p = sub.add_parser("import-csv")
@@ -824,9 +1394,22 @@ def main(argv=None):
             sys.exit("give --track tracks/flemington_45 or --file saved.html")
         list_meetings(con, html, dt.date.today() - dt.timedelta(days=int(365.25 * a.years)))
         ingest_punters(con, html)      # latest meeting's full results are on the same page
+    elif a.cmd == "import-tracks":
+        if a.list:
+            for r in con.execute("SELECT * FROM eq_tracks ORDER BY code"): print(f"{r['code']:5} {r['country'] or '':4} {r['name'] or ''}")
+        else:
+            if not a.file: sys.exit("give --file <saved page> (or --list)")
+            import_tracks(con, a.file)
     elif a.cmd == "equibase-crawl":
+        if a.all_tracks:
+            codes = stored_track_codes(con, a.countries, a.exclude)
+            if not codes: sys.exit("no tracks stored - run import-tracks --file <page> first")
+        elif a.tracks:
+            codes = a.tracks.split(",")
+        else:
+            sys.exit("give --tracks ALB,SA or --all-tracks")
         since = dt.date.today() - dt.timedelta(days=int(365.25 * a.years))
-        crawl_equibase(con, Fetcher(con, delay=a.delay), a.tracks.split(","), since, calendar_url=a.calendar_url)
+        crawl_equibase(con, Fetcher(con, delay=a.delay), codes, since, calendar_url=a.calendar_url, workers=a.workers)
     elif a.cmd == "check-robots":
         fx = Fetcher(con)
         for u in a.urls:
@@ -835,6 +1418,11 @@ def main(argv=None):
             ok = fx.allowed(u)
             print(f"{u}\n  robots.txt status: {status}  ({detail})\n  user-agent: {fx.ua}\n  verdict: "
                   f"{'ALLOWED' if ok else 'NOT ALLOWED - ' + fx.deny_reason}")
+    elif a.cmd == "parse-charts":
+        parse_charts(con, a.track.upper() if a.track else None, a.reparse, a.dump_failures)
+    elif a.cmd == "show-chart":
+        r = con.execute("SELECT text FROM chart_text WHERE track_code=? AND race_date=?", (a.track.upper(), a.date)).fetchone()
+        print("\n".join(r["text"].splitlines()[:a.lines]) if r else "no such chart stored")
     elif a.cmd == "load-bsp":
         fx = Fetcher(con)
         if a.file:

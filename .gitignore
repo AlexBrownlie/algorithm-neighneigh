@@ -1,2 +1,4 @@
 .venv/*
 raw_cache/*
+equibase_pdfs/*
+problem_races/*
